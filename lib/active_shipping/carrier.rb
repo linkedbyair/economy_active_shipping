@@ -1,3 +1,5 @@
+require 'logger'
+
 module ActiveShipping
 
   # Carrier is the abstract base class for all supported carriers.
@@ -136,6 +138,14 @@ module ActiveShipping
     include ActiveUtils::RequiresParameters
     include ActiveUtils::PostsData
 
+    def ssl_get(*args)
+      with_outbound_request_logging('GET', args) { super }
+    end
+
+    def ssl_post(*args)
+      with_outbound_request_logging('POST', args) { super }
+    end
+
     # Returns the keys that are required to be passed to the options hash
     # @note Override to return required keys in options hash for initialize method.
     # @return [Array<Symbol>]
@@ -179,6 +189,117 @@ module ActiveShipping
       end
 
       date.to_datetime
+    end
+
+    def with_outbound_request_logging(http_method, args)
+      return yield unless outbound_request_logging_enabled?
+
+      url = args[0]
+      body = args[1]
+      headers = args.find { |a| a.is_a?(Hash) } || {}
+      start = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+
+      outbound_request_logger.debug(
+        "[ActiveShipping][#{self.class.name}] #{http_method} #{url} "\
+        "headers=#{redact_sensitive(headers).inspect} "\
+        "body=#{summarize_body(body)}"
+      )
+
+      result = yield
+      duration_ms = ((Process.clock_gettime(Process::CLOCK_MONOTONIC) - start) * 1000).round(1)
+      size = result.respond_to?(:bytesize) ? result.bytesize : nil
+
+      outbound_request_logger.debug(
+        "[ActiveShipping][#{self.class.name}] #{http_method} #{url} completed "\
+        "in #{duration_ms}ms#{size ? " response_bytes=#{size}" : ''}"
+      )
+      result
+    rescue StandardError => e
+      duration_ms = ((Process.clock_gettime(Process::CLOCK_MONOTONIC) - start) * 1000).round(1)
+      outbound_request_logger.error(
+        "[ActiveShipping][#{self.class.name}] #{http_method} #{url} failed "\
+        "in #{duration_ms}ms #{e.class}: #{e.message}"
+      )
+      raise
+    end
+
+    def outbound_request_logging_enabled?
+      return @options[:log_outbound_requests] unless @options[:log_outbound_requests].nil?
+
+      if defined?(Rails) && Rails.respond_to?(:env)
+        Rails.env.development?
+      else
+        env = ENV['RAILS_ENV'] || ENV['RACK_ENV']
+        env.to_s == 'development'
+      end
+    end
+
+    def outbound_request_logger
+      if respond_to?(:logger) && logger
+        logger
+      elsif defined?(Rails) && Rails.respond_to?(:logger) && Rails.logger
+        Rails.logger
+      else
+        @outbound_request_logger ||= Logger.new($stdout)
+      end
+    end
+
+    def summarize_body(body)
+      return '<none>' if body.nil?
+
+      content = redact_sensitive(body.to_s)
+      content = content.encode('UTF-8', invalid: :replace, undef: :replace, replace: '?')
+      max = 1200
+      content.length > max ? "#{content[0...max]}... (truncated #{content.length - max} chars)" : content
+    rescue StandardError
+      '<unavailable>'
+    end
+
+    def redact_sensitive(value)
+      case value
+      when Hash
+        value.each_with_object({}) do |(k, v), acc|
+          key = k.to_s
+          acc[k] = sensitive_key?(key) ? '[FILTERED]' : redact_sensitive(v)
+        end
+      when Array
+        value.map { |v| redact_sensitive(v) }
+      when String
+        redact_sensitive_string(value)
+      else
+        value
+      end
+    end
+
+    def redact_sensitive_string(s)
+      return s if s.empty?
+
+      filtered = s.dup
+      patterns = %w[
+        authorization
+        password
+        passwd
+        token
+        secret
+        client_id
+        client_secret
+        consumer_key
+        consumer_secret
+        userid
+        login
+        key
+      ]
+      patterns.each do |name|
+        filtered.gsub!(/("#{name}"\s*:\s*")[^"]*(")/i, '\1[FILTERED]\2')
+        filtered.gsub!(/(<#{name}>)[^<]*(<\/#{name}>)/i, '\1[FILTERED]\2')
+        filtered.gsub!(/([?&]#{name}=)[^&\s]*/i, '\1[FILTERED]')
+        filtered.gsub!(/(#{name}=)[^\s&]*/i, '\1[FILTERED]')
+      end
+      filtered
+    end
+
+    def sensitive_key?(key)
+      key.match?(/authorization|password|passwd|token|secret|key|userid|login/i)
     end
   end
 end
